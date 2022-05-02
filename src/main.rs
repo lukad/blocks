@@ -8,24 +8,21 @@ use bevy::{
     render::camera::PerspectiveProjection,
 };
 
-use bevy_fly_camera::{FlyCamera, FlyCameraPlugin};
-
 fn setup(mut commands: Commands) {
-    commands
-        .spawn_bundle(PerspectiveCameraBundle {
-            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 10.0))
-                .looking_at(Vec3::new(0.0, 0.0, 0.0), Vec3::Y),
-            perspective_projection: PerspectiveProjection {
-                near: 0.001,
-                far: 1000.0,
-                ..Default::default()
-            },
+    commands.spawn_bundle(PerspectiveCameraBundle {
+        transform: Transform::from_translation(Vec3::new(0.0, 0.0, 10.0))
+            .looking_at(Vec3::new(0.0, 0.0, 0.0), Vec3::Y),
+        perspective_projection: PerspectiveProjection {
+            near: 0.001,
+            far: 1000.0,
             ..Default::default()
-        })
-        .insert(FlyCamera {
-            sensitivity: 25.0,
-            ..Default::default()
-        });
+        },
+        ..Default::default()
+    });
+    // .insert(FlyCamera {
+    //     sensitivity: 25.0,
+    //     ..Default::default()
+    // });
 }
 
 fn cursor_grab_system(mut windows: ResMut<Windows>, btn: Res<Input<MouseButton>>) {
@@ -38,7 +35,7 @@ fn cursor_grab_system(mut windows: ResMut<Windows>, btn: Res<Input<MouseButton>>
 }
 
 fn main() {
-    App::build()
+    App::new()
         .insert_resource(WindowDescriptor {
             title: "voxels".into(),
             ..Default::default()
@@ -47,9 +44,9 @@ fn main() {
         .add_plugin(FrameTimeDiagnosticsPlugin::default())
         .add_plugin(LogDiagnosticsPlugin::default())
         .add_plugin(VoxelPlugin)
-        .add_plugin(FlyCameraPlugin)
-        .add_startup_system(setup.system())
-        .add_system(bevy::input::system::exit_on_esc_system.system())
-        .add_system(cursor_grab_system.system())
+        // .add_plugin(FlyCameraPlugin)
+        .add_startup_system(setup)
+        .add_system(bevy::input::system::exit_on_esc_system)
+        .add_system(cursor_grab_system)
         .run();
 }

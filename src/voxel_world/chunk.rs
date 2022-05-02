@@ -8,17 +8,25 @@ use crate::voxel_world::ChunkWorld;
 
 use bevy::{
     diagnostic::{Diagnostic, DiagnosticId, Diagnostics},
+    ecs::system::{lifetimeless::SRes, SystemParamItem},
     math::Vec3Swizzles,
+    pbr::MaterialPipeline,
     prelude::*,
     reflect::TypeUuid,
     render::{
-        mesh::{Indices, VertexAttributeValues},
-        pipeline::{PipelineDescriptor, PrimitiveTopology, RenderPipeline},
-        render_graph::{base, AssetRenderResourcesNode, RenderGraph},
-        renderer::RenderResources,
-        shader::ShaderStages,
+        mesh::{Indices, InnerMeshVertexBufferLayout, MeshVertexAttribute, VertexAttributeValues},
+        render_asset::{PrepareAssetError, RenderAsset, RenderAssets},
+        render_resource::{
+            std140::{AsStd140, Std140},
+            BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+            BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
+            BufferInitDescriptor, BufferSize, BufferUsages, PrimitiveTopology,
+            RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
+            SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension, VertexFormat,
+        },
+        renderer::RenderDevice,
     },
-    utils::Instant,
+    utils::{Hashed, Instant},
 };
 
 use lazy_static::lazy_static;
@@ -27,19 +35,21 @@ const CHUNK_DATA_GENERATION_TIME: DiagnosticId =
     DiagnosticId::from_u128(74345255989977209082044397486567331055);
 const CHUNK_MESH_GENERATION_TIME: DiagnosticId =
     DiagnosticId::from_u128(248235940287512337153113599483964887382);
-const CHUNK_LIGHTMAP_GENERATION_TIME: DiagnosticId =
-    DiagnosticId::from_u128(263687617396918363737600904402094845525);
 
 const CHUNK_WIDTH: usize = 16;
 const CHUNK_HEIGHT: usize = 128;
 
+#[derive(Component)]
 pub struct GenerateLightmap;
+#[derive(Component)]
 pub struct ChunkToSpawn(IVec2);
+#[derive(Component)]
 pub struct Chunk {
     pub coord: IVec2,
     pub biome: Biome,
 }
 
+#[derive(Component)]
 pub struct ChunkData {
     voxels: HashMap<IVec3, Voxel>,
 }
@@ -48,7 +58,6 @@ impl Default for ChunkData {
     fn default() -> Self {
         Self {
             voxels: HashMap::new(),
-            ..Default::default()
         }
     }
 }
@@ -107,7 +116,7 @@ impl ChunkData {
                     continue;
                 }
 
-                vertices.extend_from_slice(&verts.map(|v| v + local_coord.as_f32()));
+                vertices.extend_from_slice(&verts.map(|v| v + local_coord.as_vec3()));
 
                 indices.extend_from_slice(&[
                     vertex_index + 0,
@@ -118,7 +127,7 @@ impl ChunkData {
                     vertex_index + 2,
                 ]);
 
-                normals.push(normal.as_f32().into());
+                normals.push(normal.as_vec3().into());
 
                 uvs.extend_from_slice(&voxel.block.uvs(face));
 
@@ -139,31 +148,164 @@ impl ChunkData {
     }
 }
 
-#[derive(RenderResources, Default, TypeUuid)]
+#[derive(Debug, Clone, TypeUuid)]
 #[uuid = "3bf9e361-f29d-4d6c-92cf-93298466c620"]
 pub struct ChunkMaterial {
-    pub texture: Handle<Texture>,
+    color: Color,
+    albedo_texture: Handle<Image>,
 }
 
-impl ChunkMaterial {
-    pub const ATTRIBUTE_DATA: &'static str = "Vertex_Data";
+const ATTRIBUTE_DATA: MeshVertexAttribute =
+    MeshVertexAttribute::new("Data", 988540917, VertexFormat::Uint32);
+
+#[derive(Clone)]
+pub struct GpuChunkMaterial {
+    pub _buffer: Buffer,
+    pub bind_group: BindGroup,
+    pub albedo_texture: Handle<Image>,
 }
 
-struct ChunkRenderPipelines(RenderPipelines);
+impl RenderAsset for ChunkMaterial {
+    type ExtractedAsset = ChunkMaterial;
+
+    type PreparedAsset = GpuChunkMaterial;
+
+    type Param = (
+        SRes<RenderDevice>,
+        SRes<MaterialPipeline<Self>>,
+        SRes<RenderAssets<Image>>,
+    );
+
+    fn extract_asset(&self) -> Self::ExtractedAsset {
+        self.clone()
+    }
+
+    fn prepare_asset(
+        extracted_asset: Self::ExtractedAsset,
+        (render_device, material_pipeline, gpu_images): &mut SystemParamItem<Self::Param>,
+    ) -> Result<
+        Self::PreparedAsset,
+        bevy::render::render_asset::PrepareAssetError<Self::ExtractedAsset>,
+    > {
+        let (albedo_texture_view, albedo_sampler) = if let Some(result) = material_pipeline
+            .mesh_pipeline
+            .get_image_texture(gpu_images, &Some(extracted_asset.albedo_texture.clone()))
+        {
+            result
+        } else {
+            return Err(PrepareAssetError::RetryNextUpdate(extracted_asset));
+        };
+
+        let color = Vec4::from_slice(&extracted_asset.color.as_linear_rgba_f32());
+        let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: None,
+            contents: color.as_std140().as_bytes(),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+        let bind_group = render_device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &material_pipeline.material_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(albedo_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(albedo_sampler),
+                },
+            ],
+        });
+
+        Ok(GpuChunkMaterial {
+            _buffer: buffer,
+            bind_group,
+            albedo_texture: extracted_asset.albedo_texture,
+        })
+    }
+}
+
+impl Material for ChunkMaterial {
+    fn bind_group(
+        material: &<Self as bevy::render::render_asset::RenderAsset>::PreparedAsset,
+    ) -> &BindGroup {
+        &material.bind_group
+    }
+
+    fn bind_group_layout(
+        render_device: &RenderDevice,
+    ) -> bevy::render::render_resource::BindGroupLayout {
+        render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: BufferSize::new(Vec4::std140_size_static() as u64),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    fn vertex_shader(asset_server: &AssetServer) -> Option<Handle<Shader>> {
+        Some(asset_server.load("shaders/chunk.wgsl"))
+    }
+
+    fn fragment_shader(asset_server: &AssetServer) -> Option<Handle<Shader>> {
+        Some(asset_server.load("shaders/chunk.wgsl"))
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline<Self>,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &Hashed<InnerMeshVertexBufferLayout>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let vertex_layout = layout.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_UV_0.at_shader_location(1),
+            ATTRIBUTE_DATA.at_shader_location(2),
+        ])?;
+        descriptor.vertex.buffers = vec![vertex_layout];
+        Ok(())
+    }
+}
 
 pub struct ChunkPlugin;
 
 impl Plugin for ChunkPlugin {
-    fn build(&self, app: &mut AppBuilder) {
-        app.add_asset::<ChunkMaterial>()
+    fn build(&self, app: &mut App) {
+        app.add_plugin(MaterialPlugin::<ChunkMaterial>::default())
             .insert_resource(ChunkWorld::default())
-            .add_startup_system(add_chunk_pipeline.system())
-            .add_startup_system(chunk_startup.system())
-            .add_startup_system(diagnostic_setup.system())
-            .add_system(spawn_chunk.system())
-            .add_system(generate_chunk_data.system())
-            .add_system(generate_chunk_mesh.system())
-            .add_system(generate_lightmap.system());
+            .add_startup_system(chunk_startup)
+            .add_startup_system(diagnostic_setup)
+            .add_system(spawn_chunk)
+            .add_system(generate_chunk_data)
+            .add_system(generate_chunk_mesh);
     }
 }
 
@@ -181,39 +323,18 @@ fn diagnostic_setup(mut diagnostics: ResMut<Diagnostics>) {
     ));
 }
 
-pub fn add_chunk_pipeline(
+fn chunk_startup(
     mut commands: Commands,
-    mut pipelines: ResMut<Assets<PipelineDescriptor>>,
-    asset_server: ResMut<AssetServer>,
     mut materials: ResMut<Assets<ChunkMaterial>>,
-    mut render_graph: ResMut<RenderGraph>,
+    asset_server: ResMut<AssetServer>,
 ) {
-    let pipeline_descriptor = PipelineDescriptor::default_config(ShaderStages {
-        vertex: asset_server.load::<Shader, _>("shaders/chunk.vert"),
-        fragment: Some(asset_server.load::<Shader, _>("shaders/chunk.frag")),
+    let material = materials.add(ChunkMaterial {
+        albedo_texture: asset_server.load("textures/blocks.png"),
+        color: Color::ORANGE_RED,
     });
-    let pipeline_handle = pipelines.add(pipeline_descriptor);
 
-    let render_pipelines =
-        RenderPipelines::from_pipelines(vec![RenderPipeline::new(pipeline_handle)]);
-
-    commands.insert_resource(ChunkRenderPipelines(render_pipelines));
-
-    render_graph.add_system_node(
-        "chunk_material",
-        AssetRenderResourcesNode::<ChunkMaterial>::new(true),
-    );
-
-    render_graph
-        .add_node_edge("chunk_material", base::node::MAIN_PASS)
-        .unwrap();
-
-    let texture = asset_server.load("textures/blocks.png");
-    let material = materials.add(ChunkMaterial { texture });
     commands.insert_resource(material);
-}
 
-fn chunk_startup(mut commands: Commands) {
     let mut coords = HashSet::new();
     for x in 0..4 {
         for y in 0..4 {
@@ -288,7 +409,6 @@ fn generate_chunk_mesh(
     query: Query<(Entity, &Chunk, &ChunkData, &Transform), Without<Handle<Mesh>>>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Res<Handle<ChunkMaterial>>,
-    render_pipelines: Res<ChunkRenderPipelines>,
     world: Res<ChunkWorld>,
     mut diagnostics: ResMut<Diagnostics>,
 ) {
@@ -299,25 +419,24 @@ fn generate_chunk_mesh(
 
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList);
 
-        mesh.set_attribute(
+        mesh.insert_attribute(
             Mesh::ATTRIBUTE_POSITION,
-            VertexAttributeValues::Float3(data.vertices.iter().map(|v| [v.x, v.y, v.z]).collect()),
+            VertexAttributeValues::Float32x3(
+                data.vertices.iter().map(|v| [v.x, v.y, v.z]).collect(),
+            ),
         );
 
-        mesh.set_attribute(
+        mesh.insert_attribute(
             Mesh::ATTRIBUTE_NORMAL,
             vec![[0.0, 0.0, 0.0]; data.vertices.len()],
         );
 
-        mesh.set_attribute(
+        mesh.insert_attribute(
             Mesh::ATTRIBUTE_UV_0,
-            VertexAttributeValues::Float2(data.uvs),
+            VertexAttributeValues::Float32x2(data.uvs),
         );
 
-        mesh.set_attribute(
-            ChunkMaterial::ATTRIBUTE_DATA,
-            VertexAttributeValues::Uint(data.data),
-        );
+        mesh.insert_attribute(ATTRIBUTE_DATA, VertexAttributeValues::Uint32(data.data));
 
         mesh.set_indices(Some(Indices::U32(data.indices)));
 
@@ -325,10 +444,10 @@ fn generate_chunk_mesh(
 
         commands
             .entity(entity)
-            .insert(material.clone())
-            .insert_bundle(MeshBundle {
+            // .insert(material.clone())
+            .insert_bundle(MaterialMeshBundle {
                 mesh,
-                render_pipelines: render_pipelines.0.clone(),
+                material: material.clone(),
                 transform: transform.clone(),
                 ..Default::default()
             })
@@ -336,18 +455,5 @@ fn generate_chunk_mesh(
 
         let end = Instant::now().duration_since(time_start);
         diagnostics.add_measurement(CHUNK_MESH_GENERATION_TIME, end.as_secs_f64());
-    }
-}
-
-fn generate_lightmap(
-    mut commands: Commands,
-    query: Query<(Entity, &ChunkData, &Handle<Mesh>), (With<GenerateLightmap>)>,
-    mut diagnostics: ResMut<Diagnostics>,
-) {
-    for (entity, chunk_data, mesh) in query.iter() {
-        let time_start = Instant::now();
-
-        let end = Instant::now().duration_since(time_start);
-        diagnostics.add_measurement(CHUNK_LIGHTMAP_GENERATION_TIME, end.as_secs_f64());
     }
 }

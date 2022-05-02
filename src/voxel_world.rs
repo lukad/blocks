@@ -15,7 +15,7 @@ use noise::{Fbm, NoiseFn};
 pub struct VoxelPlugin;
 
 impl Plugin for VoxelPlugin {
-    fn build(&self, app: &mut AppBuilder) {
+    fn build(&self, app: &mut App) {
         app.insert_resource(ChunkWorld::default())
             .add_plugin(chunk::ChunkPlugin);
     }
@@ -51,7 +51,7 @@ impl ChunkWorld {
     }
 
     pub(crate) fn get_height(&self, biome: &Biome, coord: &IVec2) -> i32 {
-        let noise = self.get_noise_2d(coord.as_f64(), biome.terrain_scale, 0.0);
+        let noise = self.get_noise_2d(coord.as_dvec2(), biome.terrain_scale, 0.0);
         (biome.terrain_height as f64 * noise) as i32 + biome.ground_height as i32
     }
 
@@ -86,7 +86,7 @@ impl ChunkWorld {
 
         for lode in biome.lodes {
             if lode.range.contains(&(coord.y as u8)) {
-                if self.get_noise_3d(coord.as_f64(), lode.scale, lode.offset, lode.threshold) {
+                if self.get_noise_3d(coord.as_dvec3(), lode.scale, lode.offset, lode.threshold) {
                     block = lode.block;
                 }
             }
