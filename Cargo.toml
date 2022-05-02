@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 bevy = { version = "0.7", features = ["dynamic"] }
-bevy_fly_camera = "0.8.0"
+bevy_flycam = "0.7"
 lazy_static = "1.4"
 noise = "0.7"
